@@ -110,6 +110,7 @@
 # 2016-09-22 retry on 500 error from ACME server (1.44)
 # 2016-09-22 added additional checks and retry on 500 error from ACME server (1.45)
 # 2016-09-24 merged in IPv6 support (1.46)
+# portability branch
 # ---------------------------------------------------------------------------
 
 PROGNAME=${0##*/}
@@ -150,9 +151,11 @@ ORIGCMD="$0 $*"
 cert_archive() {  # Archive certificate file by copying with dates at end.
   certfile=$1
   enddate=$(openssl x509 -in "$certfile" -noout -enddate 2>/dev/null| cut -d= -f 2-)
-  formatted_enddate=$(os_date -d "${enddate}" +%F)
+  enddate_s=$(date_epoc "$enddate")
+  formatted_enddate=$(date_fmt "${enddate_s}")
   startdate=$(openssl x509 -in "$certfile" -noout -startdate 2>/dev/null| cut -d= -f 2-)
-  formatted_startdate=$(os_date -d "${startdate}" +%F)
+  startdate_s=$(date_epoc "$startdate")
+  formatted_startdate=$(date_fmt "${startdate_s}")
   cp "${certfile}" "${certfile}_${formatted_startdate}_${formatted_enddate}"
   info "archiving old certificate file to ${certfile}_${formatted_startdate}_${formatted_enddate}"
 }
@@ -178,8 +181,7 @@ check_challenge_completion() { # checks with the ACME server if our challenge is
       error_exit "$domain:Verify error:$code"
     fi
 
-    # shellcheck disable=SC2086
-    status=$(echo $response | os_grep -Po '"status":[ ]*"[^"]+"' | cut -d '"' -f 4)
+    status=$(json_get "$response" status)
 
     # If ACME respose is valid, then break out of loop
     if [ "$status" == "valid" ] ; then
@@ -189,8 +191,8 @@ check_challenge_completion() { # checks with the ACME server if our challenge is
 
     # if ACME response is that their check gave an invalid response, error exit
     if [ "$status" == "invalid" ] ; then
-      error=$(echo "$response" | os_grep -Po '"error":[ ]*{[^}]*}' | os_grep -o '"detail":[ ]*"[^"]*"' | cut -d '"' -f 4)
-      error_exit "$domain:Verify error:$error"
+      err_detail=$(json_get "$response" detail)
+      error_exit "$domain:Verify error:$err_detail"
     fi
 
     # if ACME response is pending ( they haven't completed checks yet) then wait and try again.
@@ -204,7 +206,7 @@ check_challenge_completion() { # checks with the ACME server if our challenge is
   done
 
   if [[ "$DEACTIVATE_AUTH" == "true" ]]; then
-    deactivate_url=$(echo "$responseHeaders" | os_grep "^Link" | cut -d " " -f 2| cut -d ';' -f 1 | os_sed 's/<//g' | os_sed 's/>//g')
+    deactivate_url=$(echo "$responseHeaders" | os_grep "^Link" | awk -F"[<>]" '{print $2}')
     deactivate_url_list="$deactivate_url_list $deactivate_url"
     debug "adding url to deactivate list - $deactivate_url"
   fi
@@ -218,12 +220,12 @@ check_getssl_upgrade() { # check if a more recent version of code is available a
   elif [ $errcode -gt 0 ]; then
     error_exit "curl error : $errcode"
   fi
-  latestversion=$(echo "$latestcode" | os_grep VERSION= | head -1| awk -F'"' '{print $2}')
+  latestversion=$(echo "$latestcode" | awk -F '"' '$1 == "VERSION=" {print $2}')
   latestvdec=$(echo "$latestversion"| tr -d '.')
   localvdec=$(echo "$VERSION"| tr -d '.' )
   debug "current code is version ${VERSION}"
   debug "Most recent version is  ${latestversion}"
-  # use a default of 0 for cases where the latest code has not been obtained. 
+  # use a default of 0 for cases where the latest code has not been obtained.
   if [ "${latestvdec:-0}" -gt "$localvdec" ]; then
     if [ ${_UPGRADE} -eq 1 ]; then
       temp_upgrade="$(mktemp)"
@@ -327,6 +329,41 @@ copy_file_to_location() { # copies a file, using scp if required.
   fi
 }
 
+date_epoc() { # convert the date into epoch time
+  if [[ "$os" == "bsd" ]]; then
+    date -j -f "%b %d %T %Y %Z" "$1" +%s
+  elif [[ "$os" == "mac" ]]; then
+    date -j -f "%b %d %T %Y %Z" "$1" +%s
+  else
+    date -d "$1" +%s
+  fi
+
+}
+
+date_fmt() { # format date from epoc time to YYYY-MM-DD
+  if [[ "$os" == "bsd" ]]; then
+    date -j -f "%s" "$1" +%F
+  elif [[ "$os" == "mac" ]]; then # MAC so use gsed
+    date -j -f "%s" "$1" +%F
+  else
+    date -d "@$1" +%F
+  fi
+}
+
+date_renew() { # calculates the renewal time in epoch and formatted
+  if [[ "$os" == "bsd" ]]; then
+    date_now=$(date "+%b %d %T %Y %Z")
+    date_now_s=$( date_epoc "$date_now" )
+    echo "$((date_now_s + RENEW_ALLOW*24*60*60))"
+  elif [[ "$os" == "mac" ]]; then # MAC so use gsed
+    date_now=$(date "+%b %d %T %Y %Z")
+    date_now_s=$( date_epoc "$date_now" )
+    echo "$((date_now_s + RENEW_ALLOW*24*60*60))"
+  else
+    echo "$(date -d "${RENEW_ALLOW} days" +%s)"
+  fi
+}
+
 debug() { # write out debug info if the debug flag has been set
   if [ ${_USE_DEBUG} -eq 1 ]; then
     echo "$@"
@@ -345,8 +382,7 @@ getcr() { # get curl response
   response=$(curl --silent "$url")
   ret=$?
   debug response  "$response"
-  # shellcheck disable=SC2086
-  code=$(echo $response | os_grep -Eo '"status":[ ]*[0-9]*' | cut -d : -f 2)
+  code=$(json_get "$response" status)
   debug code "$code"
   debug getcr return code $ret
   return $ret
@@ -404,11 +440,28 @@ info() { # write out info as long as the quiet flag has not been set.
   fi
 }
 
-os_date() { # use different date version for different os types
-  if [[ "$os" == "mac" ]]; then
-    gdate "${@}"
+json_get() { # get the value corresponding to $2 in the JSON pased as $1.
+  # remove newlines, so it's a single chunk of JSON
+  json_data=$( echo "$1" | tr '\n' ' ')
+  # if $3 is defined, this is the section which the item is in.
+  if [ ! -z "$3" ]; then
+    jg_section=$(echo "$json_data" | awk -F"[}]" '{for(i=1;i<=NF;i++){if($i~/\"'"${3}"'\"/){print $i}}}')
+    if [ "$2" == "uri" ]; then
+      jg_subsect=$(echo "$jg_section" | awk -F"[,]" '{for(i=1;i<=NF;i++){if($i~/\"'"${2}"'\"/){print $(i)}}}')
+      jg_result=$(echo "$jg_subsect" | awk -F'"' '{print $4}')
+    else
+      jg_result=$(echo "$jg_section" | awk -F"[,:}]" '{for(i=1;i<=NF;i++){if($i~/\"'"${2}"'\"/){print $(i+1)}}}')
+    fi
   else
-    date "${@}"
+    jg_result=$(echo "$json_data" |awk -F"[,:}]" '{for(i=1;i<=NF;i++){if($i~/\"'"${2}"'\"/){print $(i+1)}}}')
+  fi
+  # check number of quotes
+  jg_q=${jg_result//[^\"]/}
+  # if 2 quotes, assume it's a quoted variable and just return the data within the quotes.
+  if [ ${#jg_q} -eq 2 ]; then
+    echo "$jg_result" | awk -F'"' '{print $2}'
+  else
+    echo "$jg_result"
   fi
 }
 
@@ -489,7 +542,7 @@ send_signed_request() { # Sends a request to the ACME server, signed with your p
 
   # get nonce from ACME server
   nonceurl="$CA/directory"
-  nonce=$($CURL -I $nonceurl | os_grep "^Replay-Nonce:" | os_sed s/\\r//|os_sed s/\\n//| cut -d ' ' -f 2)
+  nonce=$($CURL -I $nonceurl | os_grep "^Replay-Nonce:" | awk '{print $2}' | tr -d '\r\n ')
 
   debug nonce "$nonce"
 
@@ -520,9 +573,11 @@ send_signed_request() { # Sends a request to the ACME server, signed with your p
     responseHeaders=$(os_sed 's/\r//g' "$CURL_HEADER")
     debug responseHeaders "$responseHeaders"
     debug response  "$response"
-    code=$(os_grep ^HTTP "$CURL_HEADER" | tail -1 | cut -d " " -f 2)
+    code=$(awk ' $1 ~ "^HTTP" {print $2}' "$CURL_HEADER" | tail -1)
     debug code "$code"
-    response_status=$(echo "$response"| os_grep status | head -1 | awk -F'"' '{print $4}')
+    response_status=$(json_get "$response" status | head -1)
+    debug "response status = $response_status"
+
     if [ "$code" -eq 500 ]; then
       info "error on acme server - trying again ...."
       sleep 2
@@ -585,10 +640,10 @@ write_domain_template() { # write out a template file for a domain.
 	#ACL=('/var/www/${DOMAIN}/web/.well-known/acme-challenge'
 	#     'ssh:server5:/var/www/${DOMAIN}/web/.well-known/acme-challenge'
 	#     'ftp:ftpuserid:ftppassword:${DOMAIN}:/web/.well-known/acme-challenge')
-	
+
 	#Enable use of a single ACL for all checks
 	#USE_SINGLE_ACL="true"
-	
+
 	# Location for all your certs, these can either be on the server (so full path name) or using ssh as for the ACL
 	#DOMAIN_CERT_LOCATION="ssh:server5:/etc/ssl/domain.crt"
 	#DOMAIN_KEY_LOCATION="ssh:server5:/etc/ssl/domain.key"
@@ -737,7 +792,7 @@ if [[ $_UPGRADE_CHECK -eq 1 ]]; then
 fi
 
 # get latest agreement from CA (as default)
-AGREEMENT=$(curl -I ${CA}/terms 2>/dev/null | grep "Location:" | awk '{print $2}'|os_sed 's/\r//')
+AGREEMENT=$(curl -I ${CA}/terms 2>/dev/null | awk '$1 ~ "Location:" {print $2}'|tr -d '\r')
 
 # if nothing in command line, print help and exit.
 if [ -z "$DOMAIN" ] && [ ${_CHECK_ALL} -ne 1 ]; then
@@ -917,7 +972,11 @@ if [[ "${CHECK_REMOTE}" == "true" ]] && [ $_FORCE_RENEW -eq 0 ]; then
           # check renew-date on ex_cert and compare to local ( if local exists)
           enddate_ex=$(echo "$EX_CERT" | openssl x509 -noout -enddate 2>/dev/null| cut -d= -f 2-)
           enddate_lc=$(openssl x509 -noout -enddate < "$CERT_FILE" 2>/dev/null| cut -d= -f 2-)
-          if [ "$(os_date -d "$enddate_ex" +%s)" -gt "$(os_date -d "$enddate_lc" +%s)" ]; then
+          enddate_ex_s=$(date_epoc "$enddate_ex")
+          enddate_lc_s=$(date_epoc "$enddate_lc")
+          debug "external cert has enddate $enddate_ex ( $enddate_ex_s ) "
+          debug "local    cert has enddate $enddate_lc ( $enddate_lc_s ) "
+          if [ "$enddate_ex_s" -gt "$enddate_lc_s" ]; then
             # remote has longer to expiry date than local copy.
             # archive local copy and save remote to local
             cert_archive "$CERT_FILE"
@@ -955,9 +1014,10 @@ fi # end of .... check_remote is true then connect and obtain the current certif
 if [ -f "$CERT_FILE" ]; then
   debug "certificate $CERT_FILE exists"
   enddate=$(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null| cut -d= -f 2-)
-  debug "enddate is $enddate"
+  debug "local cert is valid until $enddate"
   if [[ "$enddate" != "-" ]]; then
-    if [[ $(os_date -d "${RENEW_ALLOW} days" +%s) -lt $(os_date -d "$enddate" +%s) ]] && [ $_FORCE_RENEW -ne 1 ]; then
+    enddate_s=$(date_epoc "$enddate")
+    if [[ $(date_renew) -lt "$enddate_s" ]] && [ $_FORCE_RENEW -ne 1 ]; then
       info "certificate for $DOMAIN is still valid for more than $RENEW_ALLOW days (until $enddate)"
       # everything is OK, so exit.
       graceful_exit
@@ -1126,11 +1186,11 @@ for d in $alldomains; do
   if [ ! -z "$code" ] && [ ! "$code" == '201' ] ; then
     error_exit "new-authz error: $response"
   fi
-  
+
   if [[ $response_status == "valid" ]]; then
     info "$d is already validated"
     if [[ "$DEACTIVATE_AUTH" == "true" ]]; then
-      deactivate_url=$(echo "$responseHeaders" | os_grep "^Location" | cut -d " " -f 2)
+      deactivate_url=$(echo "$responseHeaders" | awk ' $1 ~ "^Location" {print $2}')
       deactivate_url_list="$deactivate_url_list $deactivate_url"
       debug "url added to deactivate list $deactivate_url"
     fi
@@ -1140,15 +1200,11 @@ for d in $alldomains; do
 
     if [[ $VALIDATE_VIA_DNS == "true" ]]; then # set up the correct DNS token for verification
       # get the dns component of the ACME response
-      # shellcheck disable=SC2086
-      dns01=$(echo $response | os_grep -Po  '{[^{]*"type":[ ]*"dns-01"[^}]*')
-      debug dns01 "$dns01"
-
       # get the token from the dns component
-      token=$(echo "$dns01" | os_sed 's/,/\n'/g| os_grep '"token":'| cut -d '"' -f 4)
+      token=$(json_get "$response" "token" "dns-01")
       debug token "$token"
-
-      uri=$(echo "$dns01" | os_sed 's/,/\n'/g| os_grep '"uri":'| cut -d '"' -f 4)
+      # get the uri from the dns component
+      uri=$(json_get "$response" "uri" "dns-01")
       debug uri "$uri"
 
       keyauthorization="$token.$thumbprint"
@@ -1198,16 +1254,11 @@ for d in $alldomains; do
 			_EOF_
 
     else      # set up the correct http token for verification
-      # get the http component of the ACME response
-      # shellcheck disable=SC2086
-      http01=$(echo $response | os_grep -Po '{[ ]*"type":[ ]*"http-01"[^}]*')
-      debug http01 "$http01"
-
       # get the token from the http component
-      token=$(echo "$http01" | os_sed 's/,/\n'/g| os_grep '"token":'| cut -d '"' -f 4)
+      token=$(json_get "$response" "token" "http-01")
       debug token "$token"
-
-      uri=$(echo "$http01" | os_sed 's/,/\n'/g| os_grep '"uri":'| cut -d '"' -f 4)
+      # get the uri from the http component
+      uri=$(json_get "$response" "uri" "http-01")
       debug uri "$uri"
 
       #create signed authorization key from token.
@@ -1330,7 +1381,8 @@ debug "der $der"
 send_signed_request "$CA/acme/new-cert" "{\"resource\": \"new-cert\", \"csr\": \"$der\"}" "needbase64"
 
 # convert certificate information into correct format and save to file.
-CertData=$(os_grep -i '^Location.*' "$CURL_HEADER" |os_sed 's/\r//g'| cut -d " " -f 2)
+CertData=$(awk ' $1 ~ "^Location" {print $2}' "$CURL_HEADER" |tr -d '\r')
+debug "certdata location = $CertData"
 if [ "$CertData" ] ; then
   echo -----BEGIN CERTIFICATE----- > "$CERT_FILE"
   curl --silent "$CertData" | openssl base64 -e  >> "$CERT_FILE"
